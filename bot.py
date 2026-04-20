@@ -482,7 +482,7 @@ def handle_instagram(message: types.Message) -> None:
                 'Sec-Fetch-Mode': 'cors',
                 'Sec-Fetch-Site': 'same-origin',
             },
-            'cookiefile': None,
+            "cookiefile": "cookies.txt",
             'extract_flat': False,
         }
         
