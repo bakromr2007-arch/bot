@@ -461,30 +461,26 @@ def handle_instagram(message: types.Message) -> None:
         
         # yt-dlp bilan yuklash (yaxshilangan sozlamalar)
         ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'format': 'best',
-            'outtmpl': str(TEMP_DIR / 'ig_%(id)s.%(ext)s'),
-            'socket_timeout': 30,
-            'retries': 5,
-            'fragment_retries': 5,
-            'nocheckcertificate': True,
-            'geo_bypass': True,
-            'prefer_insecure': True,
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Linux; Android 10; SM-G973F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.120 Mobile Safari/537.36',
-                'Accept': '*/*',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'Origin': 'https://www.instagram.com',
-                'Referer': 'https://www.instagram.com/',
-                'Sec-Fetch-Dest': 'empty',
-                'Sec-Fetch-Mode': 'cors',
-                'Sec-Fetch-Site': 'same-origin',
-            },
-            "cookiefile": "cookies.txt",
-            'extract_flat': False,
-        }
+    'quiet': True,
+    'no_warnings': True,
+    'format': 'best',
+    'outtmpl': str(TEMP_DIR / 'ig_%(id)s.%(ext)s'),
+    'socket_timeout': 30,
+    'retries': 5,
+    'fragment_retries': 5,
+    'nocheckcertificate': True,
+    'geo_bypass': True,
+    'prefer_insecure': True,
+    'http_headers': {
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 10; SM-G973F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.120 Mobile Safari/537.36',
+        'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Origin': 'https://www.instagram.com',
+        'Referer': 'https://www.instagram.com/',
+    },
+    'cookiefile': 'cookies.txt',  # 🔥 MUHIM
+}
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
