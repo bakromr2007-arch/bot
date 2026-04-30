@@ -56,7 +56,6 @@ class DummyServer(BaseHTTPRequestHandler):
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
         self.wfile.write(b"Bot is active!")
-
     def log_message(self, format, *args): pass
 
 def start_dummy_server():
@@ -67,7 +66,6 @@ def start_dummy_server():
     logger.info(f"✅ Render Web Server {port}-portda ishga tushdi")
 
 # ==================== YT-DLP CONFIGURATION ====================
-# YouTube bot-tekshiruvini chetlab o'tish uchun asosiy sozlamalar
 BASE_OPTIONS = {
     'quiet': True,
     'no_warnings': True,
@@ -77,7 +75,6 @@ BASE_OPTIONS = {
     'nocheckcertificate': True,
     'geo_bypass': True,
     'prefer_insecure': True,
-    # 🔥 MUHIM: YouTube'ni aldash (Mobil ilova sifatida)
     'extractor_args': {
         'youtube': ['player_client=android,ios,web_creator']
     }
@@ -130,15 +127,12 @@ def download_youtube_audio(query, filename_hint=""):
         output_path = TEMP_DIR / f"audio_{clean_name}.mp3"
         opts = AUDIO_OPTIONS.copy()
         opts['outtmpl'] = str(TEMP_DIR / f"audio_{clean_name}.%(ext)s")
-        
-        # Agar cookies.txt bo'lsa, zaxira sifatida ishlatish
         if os.path.exists('cookies.txt'): opts['cookiefile'] = 'cookies.txt'
         
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([f"ytsearch1:{query}"])
         
         if output_path.exists(): return output_path
-        # Fallback
         files = sorted(TEMP_DIR.glob('audio_*.mp3'), key=lambda f: f.stat().st_mtime, reverse=True)
         return files[0] if files else None
     except Exception as e:
@@ -168,7 +162,7 @@ def recognize_audio(data):
 # ==================== HANDLERS ====================
 @bot.message_handler(commands=['start'])
 def start(message):
-    bot.reply_to(message, "🎵 *Musiqa botga xush kelibsiz!* \n\nNomini yozing yoki link yuboring.", parse_mode='Markdown')
+    bot.reply_to(message, "👋 *Salom! Men musiqa topuvchi botman.* \n\n🎵 Qo'shiq nomini yozing\n📱 Instagram/TikTok link yuboring\n🎤 Audio yuboring (aniqlash uchun)", parse_mode='Markdown')
 
 @bot.message_handler(content_types=['audio', 'voice'])
 def audio_handler(message):
@@ -188,7 +182,7 @@ def audio_handler(message):
         else: bot.edit_message_text("❌ Yuklab bo'lmadi", message.chat.id, status.message_id)
     else: bot.edit_message_text("❌ Musiqa topilmadi", message.chat.id, status.message_id)
 
-@bot.message_handler(func=lambda m: "instagram.com" in m.text or "tiktok.com" in m.text)
+@bot.message_handler(func=lambda m: m.text and ("instagram.com" in m.text or "tiktok.com" in m.text))
 def social_handler(message):
     status = bot.reply_to(message, "⏳ Yuklanmoqda...")
     url = message.text.strip().split('?')[0]
@@ -206,14 +200,14 @@ def social_handler(message):
                 bot.send_video(message.chat.id, f, caption="📱 Tayyor!")
             bot.delete_message(message.chat.id, status.message_id)
             threading.Thread(target=lambda: (time.sleep(30), safe_delete(v_path))).start()
-        else: bot.edit_message_text("❌ Fayl topilmadi", message.chat.id, status.message_id)
+        else: bot.edit_message_text("❌ Fayl yuklanmadi", message.chat.id, status.message_id)
     except Exception as e:
-        bot.edit_message_text(f"❌ Xato: {str(e)[:50]}", message.chat.id, status.message_id)
+        bot.edit_message_text(f"❌ Xato: Link shaxsiy yoki noto'g'ri", message.chat.id, status.message_id)
 
-@bot.message_handler(func=lambda m: True)
+@bot.message_handler(func=lambda m: m.text and not m.text.startswith('/'))
 def search_handler(message):
     query = message.text.strip()
-    status = bot.reply_to(message, f"🔍 '{query}' qidirilmoqda...")
+    status = bot.reply_to(message, f"🔍 '{query}'...")
     try:
         with yt_dlp.YoutubeDL(SEARCH_OPTIONS) as ydl:
             info = ydl.extract_info(f"ytsearch5:{query}", download=False)
@@ -227,7 +221,7 @@ def search_handler(message):
             (TEMP_DIR / f"s_{h}.txt").write_text(f"{s['id']}|{s['title']}")
             markup.add(types.InlineKeyboardButton(f"{i}. {s['title'][:40]}", callback_data=f"dl_{h}"))
         
-        bot.edit_message_text("Natijalar:", message.chat.id, status.message_id, reply_markup=markup)
+        bot.edit_message_text(f"🔍 '{query}' natijalari:", message.chat.id, status.message_id, reply_markup=markup)
     except: bot.edit_message_text("❌ Qidiruvda xato", message.chat.id, status.message_id)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('dl_'))
@@ -247,8 +241,13 @@ def inline_dl(call):
     else: bot.send_message(call.message.chat.id, "❌ Yuklab bo'lmadi")
 
 # ==================== RUN ====================
+def cleanup_worker():
+    while True:
+        time.sleep(600)
+        cleanup_old_files()
+
 if __name__ == '__main__':
     start_dummy_server()
-    threading.Thread(target=lambda: (while True: (time.sleep(600), cleanup_old_files())), daemon=True).start()
-    logger.info("🚀 Bot polling boshlandi...")
+    threading.Thread(target=cleanup_worker, daemon=True).start()
+    logger.info("🚀 Bot ishga tushdi...")
     bot.infinity_polling(timeout=30)
