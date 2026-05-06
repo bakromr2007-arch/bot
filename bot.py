@@ -44,7 +44,7 @@ if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
 
 # ==================== CONFIG ====================
-BOT_TOKEN = "8575775719:AAFk71ow9WR7crlONGpnP56qAZjO88Hj4eI"
+BOT_TOKEN = "8611851886:AAECzWeRtlBpVg2MlW-qmGt9QYFOXzFRnek"
 TEMP_DIR = Path("temp")
 TEMP_DIR.mkdir(exist_ok=True)
 
