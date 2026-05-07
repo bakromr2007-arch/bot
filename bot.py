@@ -1,759 +1,446 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Telegram Music Bot - Python 3.11.0 Compatible
-Instagram, TikTok, Shazam, YouTube Music Search
-No cookies required – uses mobile client detection bypass
-"""
-
-import sys
 import os
-import asyncio
-import tempfile
-import subprocess
-import hashlib
+import sys
 import re
-import time
-import signal
 import logging
-from importlib.metadata import version
+import subprocess
+import tempfile
+import asyncio
+import aiohttp
 from pathlib import Path
-from typing import Optional, Dict, List
-import http.server
-import socketserver
-import threading
+from urllib.parse import urlparse, unquote
 
-from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, filters
+)
 
-import telebot
-from telebot import types
-from telebot.apihelper import ApiException
-
-from shazamio import Shazam
-import yt_dlp
-
-# ==================== LOGGING ====================
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-if hasattr(sys.stdout, 'reconfigure'):
-    sys.stdout.reconfigure(encoding='utf-8')
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8522256341:AAGTDzFspSqojiTiJFLLUl8bBSQ2uoYqo84")
 
-# ==================== CONFIG ====================
-BOT_TOKEN = "8611851886:AAECzWeRtlBpVg2MlW-qmGt9QYFOXzFRnek"
-TEMP_DIR = Path("temp")
-TEMP_DIR.mkdir(exist_ok=True)
+MAX_TG_SIZE  = 20  * 1024 * 1024   # 20 MB  — Telegram fayl yuklash limiti
+MAX_URL_SIZE = 100 * 1024 * 1024   # 100 MB — URL orqali yuklash limiti
 
-MAX_FILE_SIZE = 50 * 1024 * 1024
-CLEANUP_INTERVAL = 600
-PORT = int(os.environ.get("PORT", 8000))
+CONV_MAP = {
+    "pdf":  ["docx", "pptx", "xlsx"],
+    "docx": ["pdf", "pptx"],
+    "pptx": ["pdf", "docx"],
+    "xlsx": ["pdf", "csv"],
+    "doc":  ["pdf", "docx"],
+    "xls":  ["pdf", "xlsx"],
+    "csv":  ["xlsx", "pdf"],
+    "odt":  ["pdf", "docx"],
+    "odp":  ["pdf", "pptx"],
+    "ods":  ["pdf", "xlsx"],
+}
 
-user_sessions: Dict[int, Dict] = {}
-bot_instance: Optional[telebot.TeleBot] = None
+FMT_EMOJI = {
+    "pdf": "📄", "docx": "📝", "pptx": "📊",
+    "xlsx": "📈", "csv": "📋", "doc": "📝",
+    "xls": "📈", "odt": "📝", "odp": "📊", "ods": "📈",
+}
 
-# ==================== BOT INITIALIZATION ====================
-def init_bot() -> telebot.TeleBot:
-    global bot_instance
-    try:
-        temp_bot = telebot.TeleBot(BOT_TOKEN)
-        temp_bot.remove_webhook()
-        logger.info("✅ Webhook o'chirildi")
-    except Exception as e:
-        logger.warning(f"⚠️ Webhook o'chirish xatosi: {e}")
+# user_id -> {source: "file"|"url", ...}
+user_files = {}
 
-    bot_instance = telebot.TeleBot(
-        BOT_TOKEN,
-        parse_mode=None,
-        threaded=False,
-        skip_pending=True
+
+# ──────────────────────────────────────────────
+# LibreOffice yo'lini topish (Win + Linux)
+# ──────────────────────────────────────────────
+def get_libreoffice() -> str:
+    if sys.platform == "win32":
+        for p in [
+            r"C:\Program Files\LibreOffice\program\soffice.exe",
+            r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+        ]:
+            if Path(p).exists():
+                return p
+        raise FileNotFoundError("LibreOffice topilmadi: https://www.libreoffice.org/download/download/")
+    for cmd in ["libreoffice", "soffice"]:
+        r = subprocess.run(["which", cmd], capture_output=True, text=True)
+        if r.returncode == 0:
+            return r.stdout.strip()
+    raise FileNotFoundError("LibreOffice topilmadi. `apt install libreoffice` qiling.")
+
+try:
+    LIBREOFFICE = get_libreoffice()
+    logger.info(f"LibreOffice: {LIBREOFFICE}")
+except FileNotFoundError as e:
+    logger.error(str(e))
+    LIBREOFFICE = None
+
+
+# ──────────────────────────────────────────────
+# Google Drive / Dropbox havolalarini to'g'ri linkka o'tkazish
+# ──────────────────────────────────────────────
+def normalize_url(url: str) -> str:
+    # Google Drive: /file/d/FILE_ID/view → /uc?export=download&id=FILE_ID
+    gdrive = re.match(r"https://drive\.google\.com/file/d/([^/]+)", url)
+    if gdrive:
+        return f"https://drive.google.com/uc?export=download&id={gdrive.group(1)}"
+
+    # Dropbox: ?dl=0 → ?dl=1
+    if "dropbox.com" in url:
+        return re.sub(r"[?&]dl=0", "?dl=1", url)
+
+    return url
+
+
+def guess_ext_from_url(url: str, content_type: str = "") -> str:
+    """URL yoki Content-Type dan kengaytma aniqlash"""
+    path = unquote(urlparse(url).path)
+    ext = Path(path).suffix.lower().lstrip(".")
+    if ext in CONV_MAP:
+        return ext
+
+    # Content-Type orqali
+    ct_map = {
+        "application/pdf": "pdf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+        "application/msword": "doc",
+        "text/csv": "csv",
+    }
+    for ct, e in ct_map.items():
+        if ct in content_type:
+            return e
+    return ext
+
+
+# ──────────────────────────────────────────────
+# /start va /help
+# ──────────────────────────────────────────────
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lo = "✅ LibreOffice tayyor" if LIBREOFFICE else "❌ LibreOffice o'rnatilmagan!"
+    await update.message.reply_text(
+        "👋 Salom! Men *Fayl Konverter* botman.\n\n"
+        "📎 *Ikki usulda fayl yuborishingiz mumkin:*\n\n"
+        "1️⃣ *To'g'ridan fayl* — 20 MB gacha\n"
+        "   Telegramga fayl biriktiring va yuboring\n\n"
+        "2️⃣ *Havola (URL)* — 100 MB gacha 🔥\n"
+        "   Google Drive, Dropbox yoki to'g'ri link yuboring\n"
+        "   Misol: `https://drive.google.com/file/d/ABC.../view`\n\n"
+        "📋 *Formatlar:*\n"
+        "• PDF ↔ DOCX, PPTX, XLSX\n"
+        "• DOCX → PDF, PPTX\n"
+        "• PPTX → PDF, DOCX\n"
+        "• XLSX → PDF, CSV\n\n"
+        f"{lo}\n\n"
+        "Boshlash uchun fayl yuboring yoki link yozing! 🚀",
+        parse_mode="Markdown"
     )
-    return bot_instance
 
-bot = init_bot()
 
-# ==================== DUMMY HTTP SERVER ====================
-class DummyHandler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is running")
-
-def start_dummy_server():
-    try:
-        server = socketserver.TCPServer(("0.0.0.0", PORT), DummyHandler)
-        logger.info(f"🌐 Dummy HTTP server ishga tushdi: 0.0.0.0:{PORT}")
-        server.serve_forever()
-    except Exception as e:
-        logger.error(f"Dummy server xatosi: {e}")
-
-# ==================== YT-DLP CONFIGURATION (NO COOKIES) ====================
-# Umumiy mobil foydalanuvchi agenti va botdan qochish sarlavhalari
-MOBILE_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5845.163 Mobile Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.5',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Connection': 'keep-alive',
-    'Upgrade-Insecure-Requests': '1',
-    'Sec-Fetch-Dest': 'document',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Site': 'none',
-    'Sec-Fetch-User': '?1',
-    'DNT': '1',
-}
-
-BASE_OPTIONS = {
-    'quiet': True,
-    'no_warnings': True,
-    'socket_timeout': 30,
-    'retries': 5,
-    'fragment_retries': 5,
-    'nocheckcertificate': True,
-    'geo_bypass': True,
-    'prefer_insecure': True,
-    'http_headers': MOBILE_HEADERS,
-}
-
-INSTAGRAM_OPTIONS = {
-    **BASE_OPTIONS,
-    'format': 'best',
-    'outtmpl': str(TEMP_DIR / 'ig_%(id)s.%(ext)s'),
-    'extractor_args': {
-        'instagram': {
-            'app_id': ['com.instagram.android'],
-            'webp': ['1'],
-        }
-    },
-}
-
-TIKTOK_OPTIONS = {
-    **BASE_OPTIONS,
-    'format': 'best',
-    'outtmpl': str(TEMP_DIR / 'tt_%(id)s.%(ext)s'),
-    'extractor_args': {
-        'tiktok': {
-            'app_name': ['trill'],
-            'app_version': ['28.1.3'],
-        }
-    },
-}
-
-AUDIO_OPTIONS = {
-    **BASE_OPTIONS,
-    'format': 'bestaudio/best',
-    'outtmpl': str(TEMP_DIR / 'audio_%(title)s.%(ext)s'),
-    'restrictfilenames': True,
-    'windowsfilenames': True,
-    'socket_timeout': 600,
-    'read_timeout': 600,
-    'postprocessors': [{
-        'key': 'FFmpegExtractAudio',
-        'preferredcodec': 'mp3',
-        'preferredquality': '196',
-    }],
-    'extractor_args': {
-        'youtube': {
-            # Muhim: bir nechta player_client sinab ko‘riladi, bot blokidan qochiladi
-            'player_client': ['android', 'ios', 'web'],
-            'skip': ['webpage'],
-        }
-    },
-}
-
-SEARCH_OPTIONS = {
-    **BASE_OPTIONS,
-    'extract_flat': True,
-    'extractor_args': {
-        'youtube': {
-            'player_client': ['android', 'ios', 'web'],
-            'skip': ['webpage'],
-        }
-    },
-}
-
-# ==================== UTILITY FUNCTIONS ====================
-def cleanup_old_files() -> None:
-    try:
-        current_time = time.time()
-        deleted_count = 0
-        for filepath in TEMP_DIR.iterdir():
-            if filepath.is_file():
-                file_age = current_time - filepath.stat().st_mtime
-                if file_age > CLEANUP_INTERVAL:
-                    filepath.unlink()
-                    deleted_count += 1
-        if deleted_count > 0:
-            logger.info(f"🧹 {deleted_count} ta eski fayl o'chirildi")
-    except Exception as e:
-        logger.error(f"Cleanup xatosi: {e}")
-
-def safe_delete(filepath: Optional[str | Path]) -> None:
-    try:
-        if filepath:
-            path = Path(filepath)
-            if path.exists() and path.is_file():
-                path.unlink()
-    except Exception as e:
-        logger.debug(f"Delete xatosi: {e}")
-
-def create_hash(text: str) -> str:
-    return hashlib.md5(str(text).encode('utf-8')).hexdigest()[:12]
-
-def clean_filename(text: str) -> str:
-    if not text:
-        return "audio"
-    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', text)
-    text = re.sub(r'\s+', '_', text)
-    text = text[:50]
-    return text.strip('_') or "audio"
-
-def format_duration(seconds: Optional[int | float]) -> str:
-    try:
-        total_seconds = int(float(seconds))
-        minutes = total_seconds // 60
-        secs = total_seconds % 60
-        return f" ({minutes}:{secs:02d})"
-    except (TypeError, ValueError):
-        return ""
-
-def is_instagram_url(url: str) -> bool:
-    patterns = [r'instagram\.com/(p|reel|reels|tv)/', r'instagram\.com/stories/']
-    url_lower = url.lower().strip()
-    return any(re.search(pattern, url_lower) for pattern in patterns)
-
-def is_tiktok_url(url: str) -> bool:
-    patterns = [r'tiktok\.com/', r'vm\.tiktok\.com/', r'vt\.tiktok\.com/']
-    url_lower = url.lower().strip()
-    return any(re.search(pattern, url_lower) for pattern in patterns)
-
-# ==================== SHAZAM RECOGNITION ====================
-async def recognize_audio_async(audio_bytes: bytes) -> Dict:
-    temp_file = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3', dir=TEMP_DIR) as temp_file:
-            temp_file.write(audio_bytes)
-            temp_path = temp_file.name
-        shazam = Shazam()
-        result = await shazam.recognize(temp_path)
-        if result and 'track' in result:
-            track = result['track']
-            return {
-                'found': True,
-                'title': track.get('title', 'Unknown'),
-                'artist': track.get('subtitle', 'Unknown'),
-            }
-    except Exception as e:
-        logger.error(f"Shazam xatosi: {e}")
-    finally:
-        if temp_file:
-            safe_delete(temp_path)
-    return {'found': False}
-
-def recognize_audio(audio_bytes: bytes) -> Dict:
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(recognize_audio_async(audio_bytes))
-        loop.close()
-        return result
-    except Exception as e:
-        logger.error(f"Async loop xatosi: {e}")
-        return {'found': False}
-
-# ==================== DOWNLOAD FUNCTIONS ====================
-def download_youtube_audio(query: str, filename_hint: str = "") -> Optional[Path]:
-    try:
-        clean_name = clean_filename(filename_hint or query)
-        output_path = TEMP_DIR / f"audio_{clean_name}.mp3"
-        options = AUDIO_OPTIONS.copy()
-        options['outtmpl'] = str(TEMP_DIR / f"audio_{clean_name}.%(ext)s")
-
-        if re.match(r'https?://', query):
-            download_url = query
-        else:
-            download_url = f"ytsearch1:{query}"
-
-        with yt_dlp.YoutubeDL(options) as ydl:
-            ydl.download([download_url])
-
-        if output_path.exists():
-            file_size = output_path.stat().st_size
-            logger.info(f"✅ Audio yuklandi: {file_size / (1024*1024):.2f} MB")
-            return output_path
-
-        mp3_files = sorted(
-            TEMP_DIR.glob('audio_*.mp3'),
-            key=lambda f: f.stat().st_mtime,
-            reverse=True
-        )
-        if mp3_files and (time.time() - mp3_files[0].stat().st_mtime) < 120:
-            file_size = mp3_files[0].stat().st_size
-            logger.info(f"✅ Audio topildi: {file_size / (1024*1024):.2f} MB")
-            return mp3_files[0]
-    except Exception as e:
-        logger.error(f"Audio yuklash xatosi: {e}")
-    return None
-
-def extract_audio_from_video(video_path: str | Path, duration: int = 10) -> Optional[Path]:
-    try:
-        video_path = Path(video_path)
-        audio_path = video_path.parent / f"{video_path.stem}_audio.mp3"
-        command = [
-            'ffmpeg', '-i', str(video_path), '-t', str(duration),
-            '-vn', '-acodec', 'mp3', '-ar', '44100', '-ab', '128k', '-y', str(audio_path)
-        ]
-        subprocess.run(command, capture_output=True, timeout=60, check=False)
-        if audio_path.exists() and audio_path.stat().st_size > 0:
-            return audio_path
-    except Exception as e:
-        logger.error(f"Audio extraction xatosi: {e}")
-    return None
-
-# ==================== MESSAGE HANDLERS ====================
-# (qolgan handler funksiyalar avvalgi versiyadagi kabi, faqat yuklash/xatolik logikasi
-#  yuqoridagi yangi sozlamalardan foydalanadi)
-# -------------------------------------------------------------------
-# Pastdagi barcha handlerlar o'zgarishsiz qoldirildi, ular yangi global
-# AUDIO_OPTIONS, SEARCH_OPTIONS dan foydalanadi.
-
-@bot.message_handler(commands=['start', 'help'])
-def start_command(message: types.Message) -> None:
-    cleanup_old_files()
-    welcome_text = (
-        "👋 *Salom! Musiqa topuvchi botman* 🎵\n\n"
-        "📱 *Instagram/TikTok* linki yuboring\n"
-        "🎤 *Qo'shiq* yoki *ijrochi* nomini yozing\n"
-        "🎵 *Audio* fayl yuboring (aniqlash uchun)\n\n"
-        "👨‍💻 Dasturchi: @Rustamov_v1"
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📖 *Qo'llanma:*\n\n"
+        "*Usul 1 — Fayl (20 MB gacha):*\n"
+        "Faylni bevosita chatga yuboring\n\n"
+        "*Usul 2 — Havola (100 MB gacha):*\n"
+        "• Google Drive havolasini yuboring\n"
+        "  (`drive.google.com/file/d/...`)\n"
+        "• Dropbox havolasini yuboring\n"
+        "• Yoki boshqa to'g'ri fayl linkini yuboring\n\n"
+        "⚠️ Google Drive da fayl *\"Havola orqali ko'rish\"* rejimida bo'lishi kerak",
+        parse_mode="Markdown"
     )
-    try:
-        bot.send_message(message.chat.id, welcome_text, parse_mode='Markdown')
-    except:
-        bot.send_message(message.chat.id, welcome_text.replace('*', ''))
 
-@bot.message_handler(content_types=['audio', 'voice'])
-def handle_audio_message(message: types.Message) -> None:
-    status_msg = None
-    audio_file_path = None
-    try:
-        status_msg = bot.reply_to(message, "🎵 Musiqa aniqlanmoqda...")
-        file_id = message.audio.file_id if message.audio else message.voice.file_id
-        file_info = bot.get_file(file_id)
-        audio_data = bot.download_file(file_info.file_path)
-        result = recognize_audio(audio_data)
-        if not result['found']:
-            bot.edit_message_text("❌ Musiqa tanilmadi\n\nBoshqa audio yuboring yoki qo'shiq nomini yozing",
-                                  message.chat.id, status_msg.message_id)
-            return
-        title = result['title']
-        artist = result['artist']
-        bot.edit_message_text(f"✅ Topildi: {title} - {artist}\n⏳ Yuklanmoqda...",
-                              message.chat.id, status_msg.message_id)
-        query = f"{artist} {title}"
-        audio_file_path = download_youtube_audio(query, f"{artist}_{title}")
-        if audio_file_path and audio_file_path.exists():
-            with open(audio_file_path, 'rb') as audio_file:
-                bot.send_audio(message.chat.id, audio_file, title=title[:64],
-                               performer=artist[:64], caption=f"🎵 {title}\n👤 {artist}")
-            bot.delete_message(message.chat.id, status_msg.message_id)
-        else:
-            bot.edit_message_text(f"✅ Topildi:\n🎵 {title}\n👤 {artist}\n\n❌ Yuklanmadi, qayta urinib ko'ring",
-                                  message.chat.id, status_msg.message_id)
-    except Exception as e:
-        logger.error(f"Audio handler xatosi: {e}")
-        if status_msg:
-            try:
-                bot.edit_message_text("❌ Xatolik yuz berdi", message.chat.id, status_msg.message_id)
-            except:
-                pass
-    finally:
-        safe_delete(audio_file_path)
 
-@bot.message_handler(func=lambda m: m.text and is_instagram_url(m.text))
-def handle_instagram(message: types.Message) -> None:
-    status_msg = None
-    video_path = None
-    try:
-        url = message.text.strip().split('?')[0]
-        status_msg = bot.reply_to(message, "⏳")
-        ydl_opts = {**INSTAGRAM_OPTIONS, 'outtmpl': str(TEMP_DIR / 'ig_%(id)s.%(ext)s')}
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            video_id = info.get('id', 'video')
-        video_files = list(TEMP_DIR.glob(f"ig_{video_id}*"))
-        if not video_files:
-            video_files = sorted(list(TEMP_DIR.glob('ig_*.mp4')) + list(TEMP_DIR.glob('ig_*.webm')),
-                                 key=lambda f: f.stat().st_mtime, reverse=True)
-        if not video_files:
-            bot.edit_message_text("❌ Video yuklanmadi\n\nSabablar:\n• Link noto'g'ri\n• Video private\n• Instagram blok qilgan",
-                                  message.chat.id, status_msg.message_id)
-            return
-        video_path = video_files[0]
-        if video_path.suffix == '.webm':
-            mp4_path = video_path.with_suffix('.mp4')
-            try:
-                subprocess.run(['ffmpeg', '-i', str(video_path), '-c', 'copy', str(mp4_path), '-y'],
-                               capture_output=True, timeout=60, check=True)
-                safe_delete(video_path)
-                video_path = mp4_path
-            except:
-                pass
-        if video_path.stat().st_size > MAX_FILE_SIZE:
-            size_mb = video_path.stat().st_size / (1024*1024)
-            bot.edit_message_text(f"❌ Video juda katta ({size_mb:.1f} MB)\nTelegram limit: 50 MB",
-                                  message.chat.id, status_msg.message_id)
-            return
-        btn_hash = create_hash(str(video_path))
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🎵 Musiqani aniqlash", callback_data=f"music_{btn_hash}"))
-        with open(video_path, 'rb') as video_file:
-            bot.send_video(message.chat.id, video_file, reply_markup=markup,
-                           caption="📱 Instagram", supports_streaming=True, timeout=120)
-        (TEMP_DIR / f"{btn_hash}.path").write_text(str(video_path))
-        bot.delete_message(message.chat.id, status_msg.message_id)
-    except yt_dlp.utils.DownloadError as e:
-        error_msg = str(e)
-        if status_msg:
-            if "Private" in error_msg or "login" in error_msg.lower():
-                msg = "❌ Bu video private (shaxsiy)"
-            elif "unavailable" in error_msg.lower():
-                msg = "❌ Video mavjud emas"
-            else:
-                msg = "❌ Instagram video yuklanmadi\n\nQayta urinib ko'ring"
-            bot.edit_message_text(msg, message.chat.id, status_msg.message_id)
-    except Exception as e:
-        logger.error(f"Instagram xatosi: {e}")
-        if status_msg:
-            bot.edit_message_text("❌ Video yuklanmadi", message.chat.id, status_msg.message_id)
-    finally:
-        if video_path:
-            def delayed_delete():
-                time.sleep(60)
-                safe_delete(video_path)
-            threading.Thread(target=delayed_delete, daemon=True).start()
-
-@bot.message_handler(func=lambda m: m.text and is_tiktok_url(m.text))
-def handle_tiktok(message: types.Message) -> None:
-    status_msg = None
-    video_path = None
-    try:
-        url = message.text.strip()
-        status_msg = bot.reply_to(message, "📱 TikTok yuklanmoqda...")
-        ydl_opts = {**TIKTOK_OPTIONS, 'outtmpl': str(TEMP_DIR / 'tt_%(id)s.%(ext)s')}
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            video_id = info.get('id', 'video')
-        video_files = list(TEMP_DIR.glob(f"tt_{video_id}*"))
-        if not video_files:
-            video_files = sorted(list(TEMP_DIR.glob('tt_*.mp4')) + list(TEMP_DIR.glob('tt_*.webm')),
-                                 key=lambda f: f.stat().st_mtime, reverse=True)
-        if not video_files:
-            bot.edit_message_text("❌ TikTok video yuklanmadi\n\nSabablar:\n• Link noto'g'ri\n• Video private\n• TikTok blok qilgan",
-                                  message.chat.id, status_msg.message_id)
-            return
-        video_path = video_files[0]
-        if video_path.suffix == '.webm':
-            mp4_path = video_path.with_suffix('.mp4')
-            try:
-                subprocess.run(['ffmpeg', '-i', str(video_path), '-c', 'copy', str(mp4_path), '-y'],
-                               capture_output=True, timeout=60, check=True)
-                safe_delete(video_path)
-                video_path = mp4_path
-            except:
-                pass
-        if video_path.stat().st_size > MAX_FILE_SIZE:
-            size_mb = video_path.stat().st_size / (1024*1024)
-            bot.edit_message_text(f"❌ Video juda katta ({size_mb:.1f} MB)\nTelegram limit: 50 MB",
-                                  message.chat.id, status_msg.message_id)
-            return
-        btn_hash = create_hash(str(video_path))
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🎵 Musiqani aniqlash", callback_data=f"music_{btn_hash}"))
-        with open(video_path, 'rb') as video_file:
-            bot.send_video(message.chat.id, video_file, reply_markup=markup,
-                           caption="📱 TikTok", supports_streaming=True, timeout=120)
-        (TEMP_DIR / f"{btn_hash}.path").write_text(str(video_path))
-        bot.delete_message(message.chat.id, status_msg.message_id)
-    except yt_dlp.utils.DownloadError as e:
-        error_msg = str(e)
-        if status_msg:
-            if "Private" in error_msg or "login" in error_msg.lower():
-                msg = "❌ Bu video private (shaxsiy)"
-            elif "unavailable" in error_msg.lower():
-                msg = "❌ Video mavjud emas"
-            else:
-                msg = "❌ TikTok video yuklanmadi\n\nQayta urinib ko'ring"
-            bot.edit_message_text(msg, message.chat.id, status_msg.message_id)
-    except Exception as e:
-        logger.error(f"TikTok xatosi: {e}")
-        if status_msg:
-            bot.edit_message_text("❌ TikTok yuklanmadi", message.chat.id, status_msg.message_id)
-    finally:
-        if video_path:
-            def delayed_delete():
-                time.sleep(60)
-                safe_delete(video_path)
-            threading.Thread(target=delayed_delete, daemon=True).start()
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith('music_'))
-def handle_video_music_recognition(call: types.CallbackQuery) -> None:
-    audio_path = None
-    video_path = None
-    audio_file_path = None
-    try:
-        btn_hash = call.data.split('_')[1]
-        bot.answer_callback_query(call.id, "🎵 Musiqa aniqlanmoqda...")
-        path_file = TEMP_DIR / f"{btn_hash}.path"
-        if not path_file.exists():
-            bot.send_message(call.message.chat.id, "❌ Video topilmadi (vaqt o'tgan)")
-            return
-        video_path = path_file.read_text().strip()
-        if not Path(video_path).exists():
-            bot.send_message(call.message.chat.id, "❌ Video fayl o'chirilgan")
-            return
-        audio_path = extract_audio_from_video(video_path, 10)
-        if not audio_path or not audio_path.exists():
-            bot.send_message(call.message.chat.id, "❌ Audio ajratilmadi")
-            return
-        with open(audio_path, 'rb') as f:
-            audio_data = f.read()
-        result = recognize_audio(audio_data)
-        if not result['found']:
-            bot.send_message(call.message.chat.id, "❌ Musiqa tanilmadi")
-            return
-        title = result['title']
-        artist = result['artist']
-        bot.send_message(call.message.chat.id, f"✅ Topildi: {title} - {artist}\n⏳ Yuklanmoqda...")
-        query = f"{artist} {title}"
-        audio_file_path = download_youtube_audio(query, f"{artist}_{title}")
-        if audio_file_path and audio_file_path.exists():
-            with open(audio_file_path, 'rb') as audio_file:
-                bot.send_audio(call.message.chat.id, audio_file, title=title[:64],
-                               performer=artist[:64], caption=f"🎵 {title}\n👤 {artist}")
-        else:
-            bot.send_message(call.message.chat.id, f"✅ Topildi:\n🎵 {title}\n👤 {artist}\n\n❌ Yuklanmadi")
-    except Exception as e:
-        logger.error(f"Video music recognition xatosi: {e}")
-        bot.send_message(call.message.chat.id, "❌ Xatolik yuz berdi")
-    finally:
-        safe_delete(audio_path)
-        safe_delete(audio_file_path)
-        if video_path:
-            safe_delete(video_path)
-
-@bot.message_handler(func=lambda m: m.text and not m.text.startswith('/'))
-def handle_search(message: types.Message) -> None:
-    status_msg = None
-    try:
-        query = message.text.strip()
-        status_msg = bot.reply_to(message, f"🔍 '{query}' qidirilmoqda...")
-        with yt_dlp.YoutubeDL(SEARCH_OPTIONS) as ydl:
-            info = ydl.extract_info(f"ytsearch50:{query}", download=False)
-            songs = info.get('entries', [])
-        if not songs:
-            bot.edit_message_text("❌ Hech narsa topilmadi\n\nBoshqa nom bilan qidiring",
-                                  message.chat.id, status_msg.message_id)
-            return
-        user_sessions[message.chat.id] = {
-            'query': query,
-            'songs': songs,
-            'page': 0,
-            'timestamp': datetime.now()
-        }
-        show_search_results(message.chat.id, 0)
-        bot.delete_message(message.chat.id, status_msg.message_id)
-    except Exception as e:
-        logger.error(f"Qidiruv xatosi: {e}")
-        if status_msg:
-            bot.edit_message_text("❌ Qidiruvda xatolik", message.chat.id, status_msg.message_id)
-
-def show_search_results(chat_id: int, page: int = 0) -> None:
-    session = user_sessions.get(chat_id)
-    if not session:
-        bot.send_message(chat_id, "❌ Sessiya muddati tugagan\n\nYangi qidiruv bering")
+# ──────────────────────────────────────────────
+# Fayl yuborilganda (20 MB gacha)
+# ──────────────────────────────────────────────
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not LIBREOFFICE:
+        await update.message.reply_text("❌ Server xatosi: LibreOffice o'rnatilmagan.")
         return
-    query = session['query']
-    songs = session['songs']
-    total_songs = len(songs)
-    page_size = 10
-    total_pages = (total_songs + page_size - 1) // page_size
-    page = max(0, min(page, total_pages - 1))
-    start_idx = page * page_size
-    end_idx = min(start_idx + page_size, total_songs)
-    page_songs = songs[start_idx:end_idx]
 
-    text_lines = [f"🔍 *{query}*", f"📄 Sahifa: {page + 1}/{total_pages} | Jami: {total_songs} ta", ""]
-    markup = types.InlineKeyboardMarkup(row_width=5)
-    button_rows = []
-    current_row = []
-    for idx, song in enumerate(page_songs, start=1):
-        global_idx = start_idx + idx
-        title = song.get('title', 'Nomaʼlum')[:45]
-        duration = format_duration(song.get('duration'))
-        text_lines.append(f"{global_idx}. {title}{duration}")
-        h = create_hash(f"{title}_{global_idx}")
-        (TEMP_DIR / f"song_{h}.txt").write_text(f"{title}|{global_idx}")
-        btn = types.InlineKeyboardButton(str(global_idx), callback_data=f"dl_{h}")
-        current_row.append(btn)
-        if len(current_row) == 5:
-            button_rows.append(current_row)
-            current_row = []
-    if current_row:
-        button_rows.append(current_row)
-    for row in button_rows:
-        markup.add(*row)
+    doc = update.message.document
+    file_name = doc.file_name or "file"
+    ext = Path(file_name).suffix.lower().lstrip(".")
 
-    nav_buttons = []
-    if page > 0:
-        nav_buttons.append(types.InlineKeyboardButton("⬅️ Oldingi", callback_data=f"page_{page-1}"))
-    nav_buttons.append(types.InlineKeyboardButton("❌", callback_data="close_page"))
-    if page < total_pages - 1:
-        nav_buttons.append(types.InlineKeyboardButton("Keyingi ➡️", callback_data=f"page_{page+1}"))
-    if nav_buttons:
-        markup.row(*nav_buttons)
-    markup.row(
-        types.InlineKeyboardButton("🔄 Yangi qidiruv", callback_data="nav_new"),
-        types.InlineKeyboardButton("🏠 Bosh menyu", callback_data="nav_home")
-    )
-    user_sessions[chat_id]['page'] = page
+    if doc.file_size and doc.file_size > MAX_TG_SIZE:
+        size_mb = doc.file_size / 1024 / 1024
+        await update.message.reply_text(
+            f"❌ *Fayl juda katta ({size_mb:.1f} MB)*\n\n"
+            f"Telegram orqali max *20 MB* yuborishingiz mumkin.\n\n"
+            f"*100 MB gacha fayllar uchun:*\n"
+            f"Faylni Google Drive ga yuklang va havolasini yuboring:\n"
+            f"`https://drive.google.com/file/d/.../view`",
+            parse_mode="Markdown"
+        )
+        return
+
+    if ext not in CONV_MAP:
+        await update.message.reply_text(
+            f"❌ *.{ext}* formati qo'llab-quvvatlanmaydi.\n\n"
+            f"Qabul qilinadiganlar: {', '.join(f'.{k}' for k in CONV_MAP)}",
+            parse_mode="Markdown"
+        )
+        return
+
+    user_files[update.effective_user.id] = {
+        "source": "file",
+        "file_id": doc.file_id,
+        "file_name": file_name,
+        "ext": ext,
+    }
+    await send_target_keyboard(update, file_name, ext, doc.file_size or 0)
+
+
+# ──────────────────────────────────────────────
+# Matn (URL) yuborilganda
+# ──────────────────────────────────────────────
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+
+    # URL emasmi?
+    if not text.startswith("http://") and not text.startswith("https://"):
+        await update.message.reply_text(
+            "📎 Fayl yuboring yoki havola (URL) yozing.\n\n"
+            "Misol:\n`https://drive.google.com/file/d/ABC.../view`",
+            parse_mode="Markdown"
+        )
+        return
+
+    if not LIBREOFFICE:
+        await update.message.reply_text("❌ Server xatosi: LibreOffice o'rnatilmagan.")
+        return
+
+    wait_msg = await update.message.reply_text("🔍 Havola tekshirilmoqda...")
+
     try:
-        bot.send_message(chat_id, "\n".join(text_lines), reply_markup=markup, parse_mode='Markdown')
-    except:
-        bot.send_message(chat_id, "\n".join(text_lines).replace('*', ''), reply_markup=markup)
+        real_url = normalize_url(text)
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith('page_'))
-def handle_page_navigation(call: types.CallbackQuery) -> None:
-    try:
-        page = int(call.data.split('_')[1])
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-        show_search_results(call.message.chat.id, page)
-        bot.answer_callback_query(call.id)
-    except Exception as e:
-        logger.error(f"Page navigation xatosi: {e}")
-        bot.answer_callback_query(call.id, "❌ Xatolik", show_alert=True)
+        async with aiohttp.ClientSession() as session:
+            async with session.head(real_url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                content_type = resp.headers.get("Content-Type", "")
+                content_length = int(resp.headers.get("Content-Length", 0))
+                final_url = str(resp.url)
 
-@bot.callback_query_handler(func=lambda c: c.data == "close_page")
-def handle_close_page(call: types.CallbackQuery) -> None:
-    try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-        bot.answer_callback_query(call.id, "✅ Sahifa yopildi")
-        if call.message.chat.id in user_sessions:
-            del user_sessions[call.message.chat.id]
-    except Exception as e:
-        logger.error(f"Close page xatosi: {e}")
-        bot.answer_callback_query(call.id, "❌ Xatolik", show_alert=True)
+        ext = guess_ext_from_url(final_url, content_type)
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith('dl_'))
-def handle_song_download(call: types.CallbackQuery) -> None:
-    audio_file_path = None
-    callback_answered = False
-    try:
-        btn_hash = call.data.split('_')[1]
-        data_file = TEMP_DIR / f"song_{btn_hash}.txt"
-        if not data_file.exists():
-            bot.answer_callback_query(call.id, "❌ Vaqt o'tgan", show_alert=True)
-            callback_answered = True
+        if not ext or ext not in CONV_MAP:
+            await wait_msg.edit_text(
+                f"❌ Fayl formati aniqlanmadi yoki qo'llab-quvvatlanmaydi.\n\n"
+                f"Qabul qilinadiganlar: {', '.join(f'.{k}' for k in CONV_MAP)}\n\n"
+                f"Havola to'g'ridan-to'g'ri fayl bo'lishi kerak.",
+            )
             return
-        data = data_file.read_text().strip()
-        parts = data.split('|', 1)
-        title = parts[0] if parts else 'Audio'
-        bot.answer_callback_query(call.id, "⏳ Yuklanmoqda...")
-        callback_answered = True
-        audio_file_path = download_youtube_audio(title, title)
-        if audio_file_path and audio_file_path.exists():
-            with open(audio_file_path, 'rb') as audio_file:
-                bot.send_audio(call.message.chat.id, audio_file, title=title[:64],
-                               caption=f"✅ {title}", timeout=300)
+
+        if content_length and content_length > MAX_URL_SIZE:
+            size_mb = content_length / 1024 / 1024
+            await wait_msg.edit_text(
+                f"❌ Fayl juda katta ({size_mb:.1f} MB)\n"
+                f"Maksimal: 100 MB"
+            )
+            return
+
+        size_mb = content_length / 1024 / 1024 if content_length else 0
+        file_name = Path(unquote(urlparse(final_url).path)).name or f"file.{ext}"
+        if not file_name.endswith(f".{ext}"):
+            file_name = f"file.{ext}"
+
+        user_files[update.effective_user.id] = {
+            "source": "url",
+            "url": real_url,
+            "file_name": file_name,
+            "ext": ext,
+        }
+
+        await wait_msg.delete()
+        await send_target_keyboard(update, file_name, ext, content_length)
+
+    except aiohttp.ClientError as e:
+        await wait_msg.edit_text(f"❌ Havolaga ulanib bo'lmadi.\n\nXato: {str(e)[:100]}")
+    except Exception as e:
+        logger.error(f"URL check error: {e}")
+        await wait_msg.edit_text(f"❌ Xatolik: {str(e)[:150]}")
+
+
+# ──────────────────────────────────────────────
+# Format tanlash klaviaturasini yuborish
+# ──────────────────────────────────────────────
+async def send_target_keyboard(update: Update, file_name: str, ext: str, size_bytes: int):
+    targets = CONV_MAP[ext]
+    keyboard = []
+    row = []
+    for i, t in enumerate(targets):
+        row.append(InlineKeyboardButton(f"{FMT_EMOJI.get(t,'📄')} {t.upper()}", callback_data=f"convert_{t}"))
+        if len(row) == 2 or i == len(targets) - 1:
+            keyboard.append(row); row = []
+    keyboard.append([InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel")])
+
+    size_str = f"{size_bytes/1024/1024:.1f} MB" if size_bytes else "noma'lum"
+    await update.message.reply_text(
+        f"{FMT_EMOJI.get(ext,'📄')} *{file_name}* qabul qilindi!\n"
+        f"📦 Hajm: {size_str}\n\n"
+        f"Qaysi formatga o'tkazish kerak?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+
+# ──────────────────────────────────────────────
+# Tugma bosilganda — konvertatsiya
+# ──────────────────────────────────────────────
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+
+    if query.data == "cancel":
+        user_files.pop(user_id, None)
+        await query.edit_message_text("✅ Bekor qilindi.")
+        return
+
+    if not query.data.startswith("convert_"):
+        return
+
+    target_fmt = query.data.replace("convert_", "")
+    info = user_files.get(user_id)
+    if not info:
+        await query.edit_message_text("❌ Fayl topilmadi. Qayta yuboring.")
+        return
+
+    await query.edit_message_text(
+        f"⏳ *{info['file_name']}* → *{target_fmt.upper()}*\n\nKonvertatsiya qilinmoqda...",
+        parse_mode="Markdown"
+    )
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_path = Path(tmpdir) / info["file_name"]
+
+            if info["source"] == "file":
+                tg_file = await context.bot.get_file(info["file_id"])
+                file_bytes = await tg_file.download_as_bytearray()
+                src_path.write_bytes(file_bytes)
+
+            elif info["source"] == "url":
+                await query.edit_message_text(
+                    f"⬇️ Fayl yuklanmoqda...\n_{info['file_name']}_",
+                    parse_mode="Markdown"
+                )
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(info["url"], timeout=aiohttp.ClientTimeout(total=180)) as resp:
+                        if resp.status != 200:
+                            raise Exception(f"HTTP {resp.status}: Fayl yuklab bo'lmadi")
+                        total = 0
+                        with open(src_path, "wb") as f:
+                            async for chunk in resp.content.iter_chunked(1024 * 512):
+                                f.write(chunk)
+                                total += len(chunk)
+                                if total > MAX_URL_SIZE:
+                                    raise Exception("Fayl 100 MB dan oshib ketdi!")
+
+                await query.edit_message_text(
+                    f"⚙️ Konvertatsiya qilinmoqda...\n_{info['file_name']} → {target_fmt.upper()}_",
+                    parse_mode="Markdown"
+                )
+
+            result_path = convert_file(src_path, target_fmt, tmpdir)
+
+            if not result_path:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="❌ Konvertatsiya muvaffaqiyatsiz.\nFayl buzilgan yoki format mos kelmayapti."
+                )
+                return
+
+            out_name = Path(info["file_name"]).stem + "." + target_fmt
+            result_size = result_path.stat().st_size
+
+            if result_size > MAX_TG_SIZE:
+                # Natija ham katta bo'lsa — xabar ber
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=(
+                        f"⚠️ Konvertatsiya muvaffaqiyatli, lekin natija fayl\n"
+                        f"*{result_size/1024/1024:.1f} MB* — Telegram orqali yuborib bo'lmaydi (max 50 MB).\n\n"
+                        f"Faylni kichiklashtirish kerak."
+                    ),
+                    parse_mode="Markdown"
+                )
+                return
+
+            with open(result_path, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=update.effective_chat.id,
+                    document=f,
+                    filename=out_name,
+                    caption=(
+                        f"{FMT_EMOJI.get(info['ext'],'📄')} {info['ext'].upper()} → "
+                        f"{FMT_EMOJI.get(target_fmt,'📄')} {target_fmt.upper()}\n"
+                        f"✅ Muvaffaqiyatli!"
+                    )
+                )
+
+    except Exception as e:
+        err = str(e)
+        logger.error(f"Convert error: {err}")
+        if "100 MB" in err:
+            msg = "❌ Fayl 100 MB dan katta, yuklab bo'lmadi."
+        elif "HTTP" in err:
+            msg = f"❌ Fayl yuklab bo'lmadi.\n{err}"
+        elif "File is too big" in err:
+            msg = "❌ Fayl 20 MB dan katta. Havola orqali yuboring."
+        elif "timed out" in err.lower():
+            msg = "❌ Vaqt tugadi. Internet sekin yoki fayl juda katta."
         else:
-            bot.send_message(call.message.chat.id, "❌ Yuklashda xatolik\n\nQayta urinib ko'ring")
-        safe_delete(data_file)
-    except Exception as e:
-        logger.error(f"Download xatosi: {e}")
-        if not callback_answered:
-            try:
-                bot.answer_callback_query(call.id, "❌ Xatolik yuz berdi", show_alert=True)
-            except:
-                pass
+            msg = f"❌ Xatolik: `{err[:200]}`"
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode="Markdown")
     finally:
-        safe_delete(audio_file_path)
+        user_files.pop(user_id, None)
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith('nav_'))
-def handle_navigation(call: types.CallbackQuery) -> None:
-    try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except:
-        pass
-    if call.data == 'nav_home':
-        start_command(call.message)
-    elif call.data == 'nav_new':
-        bot.send_message(call.message.chat.id, "🔍 Yangi qidiruv uchun qo'shiq yoki ijrochi nomini yozing:")
 
-@bot.message_handler(func=lambda message: True, content_types=['text'])
-def handle_unknown(message: types.Message) -> None:
-    if not message.text.startswith('/'):
-        handle_search(message)
+# ──────────────────────────────────────────────
+# LibreOffice konvertatsiya
+# ──────────────────────────────────────────────
+def convert_file(src_path: Path, target_fmt: str, output_dir: str) -> Path | None:
+    fmt_map = {"docx": "docx", "doc": "docx", "xlsx": "xlsx", "xls": "xlsx",
+               "pptx": "pptx", "pdf": "pdf", "csv": "csv"}
+    lo_fmt = fmt_map.get(target_fmt, target_fmt)
 
-def shutdown_handler(signum, frame) -> None:
-    logger.info("\n🛑 Bot to'xtatilmoqda...")
-    try:
-        cleanup_old_files()
-        bot.stop_polling()
-    except Exception as e:
-        logger.error(f"Shutdown xatosi: {e}")
-    logger.info("✅ Bot to'xtatildi")
-    sys.exit(0)
+    cmd = [LIBREOFFICE, "--headless", "--convert-to", lo_fmt, "--outdir", output_dir, str(src_path)]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
 
-signal.signal(signal.SIGINT, shutdown_handler)
-signal.signal(signal.SIGTERM, shutdown_handler)
+    if proc.returncode != 0:
+        logger.error(f"LibreOffice error: {proc.stderr}")
+        return None
 
-def start_periodic_cleanup() -> None:
-    def cleanup_loop():
-        while True:
-            try:
-                time.sleep(CLEANUP_INTERVAL)
-                cleanup_old_files()
-            except Exception as e:
-                logger.error(f"Cleanup loop xatosi: {e}")
-    threading.Thread(target=cleanup_loop, daemon=True).start()
-    logger.info("🧹 Davriy tozalash yoqildi")
+    result = Path(output_dir) / f"{src_path.stem}.{lo_fmt}"
+    if result.exists():
+        return result
 
-def main() -> None:
-    logger.info("=" * 60)
-    logger.info("🎵 TELEGRAM MUSIC BOT (No cookies required)")
-    logger.info("=" * 60)
-    logger.info(f"🐍 Python: {sys.version.split()[0]}")
-    logger.info(f"📦 pyTelegramBotAPI: {version('pyTelegramBotAPI')}")
-    logger.info(f"📁 Temp katalog: {TEMP_DIR.absolute()}")
-    logger.info("=" * 60)
-    logger.info("✅ Bot ishga tushdi!")
-    logger.info("⚡ YouTube bot blokisiz ishlaydi (mobil klientlar bilan)")
-    logger.info("📱 Instagram, TikTok, Shazam, YouTube")
-    logger.info("=" * 60)
+    for f in Path(output_dir).iterdir():
+        if f.suffix.lower() == f".{lo_fmt}" and f != src_path:
+            return f
+    return None
 
-    cleanup_old_files()
-    start_periodic_cleanup()
 
-    server_thread = threading.Thread(target=start_dummy_server, daemon=True)
-    server_thread.start()
+# ──────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────
+def main():
+    if not BOT_TOKEN:
+        raise ValueError("BOT_TOKEN o'rnatilmagan!")
 
-    try:
-        logger.info("🔄 Polling boshlandi...")
-        bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30, none_stop=True)
-    except KeyboardInterrupt:
-        shutdown_handler(None, None)
-    except Exception as e:
-        logger.error(f"❌ Fatal xatolik: {e}")
-        logger.info("🔄 3 soniyadan keyin qayta ishga tushiriladi...")
-        time.sleep(3)
-        try:
-            bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30, none_stop=True)
-        except Exception as e2:
-            logger.error(f"❌ Qayta urinish muvaffaqiyatsiz: {e2}")
-            sys.exit(1)
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(CallbackQueryHandler(handle_callback))
 
-if __name__ == '__main__':
+    logger.info("Bot ishga tushdi...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
     main()
