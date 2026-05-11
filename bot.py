@@ -21,7 +21,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8522256341:AAGTDzFspSqojiTiJFLLUl8bBSQ2uoYqo84")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8522256341:AAGTDzFspSqojiTiJFLLUl8bBSQ2uoYqo8")
 
 MAX_TG_SIZE  = 20  * 1024 * 1024   # 20 MB  — Telegram fayl yuklash limiti
 MAX_URL_SIZE = 100 * 1024 * 1024   # 100 MB — URL orqali yuklash limiti
